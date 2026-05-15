@@ -384,6 +384,10 @@ the requirement that introduced them.
   model-requested override capped at an absolute ceiling of 600
   seconds, 5-second grace between SIGTERM and SIGKILL when a timeout
   trips.
+- **R30 run_shell retry budget:** 3 consecutive failed `run_shell`
+  invocations before the model is informed the budget is exhausted;
+  resets on the next productive tool result (any successful tool
+  call, shell or otherwise).
 
 ## R23. Agent identity: Swift-first coding assistant
 
@@ -542,7 +546,129 @@ implicit "resume the last session" behaviour.
   never leaks into the next task by accident, and resuming is always
   an explicit, named act.
 
-## R29. Defer tap formula creation until v1 ships
+## R29. Streaming I/O with framed chunking
+
+All conversation traffic between user, LLM, transforms, and
+persistence layers flows as token-level streams in both directions.
+There is no whole-turn buffering between the model and the rest of
+the system; rendering, transformation, tool-call dispatch, and
+persistence happen as tokens arrive.
+
+- **Outbound (LLM → user / transcript).** MLX produces tokens one at
+  a time; the runtime consumes them as a stream, runs them through
+  R16's outbound transforms incrementally, and emits them to the TTY
+  and to the R18 JSONL transcript as soon as each transform stack
+  has cleared them. Whole-turn assembly happens nowhere — the same
+  token leaves the model, is redacted (R15), is rendered, and is
+  appended to disk while still in flight.
+- **Inbound (user / tools → LLM).** Conversation context is
+  assembled as a stream of typed events (user message, tool result,
+  system note) that flow through the inbound transform stack
+  (R16, R20). Each event is a discrete frame, never a concatenated
+  blob.
+- **Chunking is the framing layer.** The runtime exposes a small set
+  of chunkers that consume the raw token stream and emit higher-level
+  units the rest of apoderado consumes:
+  - **Display chunks** — punctuation- or line-bounded segments
+    rendered to the TTY progressively so the user sees output as it
+    is produced.
+  - **Tool-call chunks** — complete structured tool calls (R5 native
+    or prompted-fallback) extracted from the stream and dispatched
+    exactly once each, regardless of whether the model is still
+    emitting subsequent tokens.
+  - **Persistence chunks** — completed conversational events
+    appended to the R18 transcript as they finalize, not as a
+    deferred end-of-turn dump.
+- **Redaction interaction.** R15 outbound redaction operates on the
+  live stream. To avoid splitting a secret across a chunk boundary
+  the redaction transform buffers a small trailing window long
+  enough to contain the longest plausible secret marker before
+  releasing tokens downstream. Buffered tokens reach the transcript
+  and the TTY at the same instant — there is no "raw tail" sitting
+  unredacted in memory longer than necessary.
+- **Cancellation interaction.** A R27 cancellation aborts the token
+  stream immediately. Tokens already cleared by the chunkers are
+  preserved (they are part of the transcript and the user's view);
+  tokens still in flight inside the redaction buffer are discarded
+  rather than flushed unredacted.
+
+## R30. `run_shell` failure retry policy
+
+A non-zero exit from `run_shell` is a recoverable event, not a
+terminal one. The model receives the failure (exit code, captured
+stdout, stderr, the command it ran) via R20's tool-result reshaping
+transform and is expected to retry with an adjusted command. The
+runtime caps how many consecutive retries the model can spend on the
+same line of investigation so a confused or looping model cannot
+burn the session.
+
+- **Budget:** 3 consecutive failed `run_shell` invocations. The
+  initial failing call counts as the first attempt; the model has at
+  most two further retries before the budget is exhausted. The value
+  is an R22 tunable.
+- **Reset rule:** any *productive* tool result — a successful
+  `run_shell` (exit code 0) or a successful non-shell tool call
+  (`read_file`, `list_dir`, `search`, `write_file`, `edit_file`) —
+  resets the counter to 0. Stepping back to investigate with read
+  tools after a shell failure is correct behaviour and is not
+  punished by the budget.
+- **Exhaustion:** after the 3rd consecutive failure the next
+  `run_shell` call returns a budget-exhausted notice instead of
+  executing. The model is instructed (via R23's system prompt) to
+  read state, search, ask the user, or report failure rather than
+  issuing another shell command. The user's conversation continues
+  normally; the counter resets the next time any tool produces a
+  result.
+- **The model adjusts each retry.** The system prompt instructs the
+  model that mechanical retry of the same command is wasted budget —
+  each attempt should change something (flags, arguments, working
+  directory, prerequisite). The runtime does *not* mechanically
+  compare command strings to enforce adjustment; this is a
+  behavioural instruction, not a hard check.
+- **Approval interaction.** Each retry is independently gated by R9
+  approval modes. A user-denied approval prompt is *not* counted as
+  a failure for retry-budget purposes — denials are user-driven, not
+  command failures.
+
+## R31. `run_shell` pre-flight usage extraction
+
+The first time a given CLI utility is invoked via `run_shell` in a
+session, apoderado extracts the utility's usage documentation and
+surfaces it to the model alongside the actual command's result.
+Subsequent invocations of the same utility within the same session
+reuse the cached docs.
+
+- **Probe order:** `<util> --help`, then `<util> --usage`, then
+  `<util> -h`, then `man <util>` (output filtered through `col -b`
+  to strip control sequences). The first probe to produce non-empty
+  output on stdout wins. All four failing is recorded as "no usage
+  available" and is not retried within the session.
+- **Caching:** extracted docs live in memory for the lifetime of the
+  session, keyed by utility basename. They are not persisted to the
+  R18 transcript — they are reproducible context, not conversation
+  history.
+- **Utility identification:** the first token of the command, after
+  stripping leading `VAR=value` environment-variable assignments and
+  any leading `sudo`. Pipelines (`a | b | c`) are treated as a list
+  of utilities, each probed and cached independently.
+- **Approval and sandbox interaction.** Usage extraction is *not*
+  gated by R9 approval — running `<util> --help` is treated as a
+  read-style probe. It still respects R24's CWD sandbox (the probe
+  runs in CWD like every other shell action), and it is bounded by
+  R26's wall-clock timeout so a misbehaving `--help` cannot hang the
+  session.
+- **Failure does not block execution.** If probes fail, time out, or
+  the utility cannot be located on `PATH`, apoderado proceeds with
+  the model's requested command and reports the extraction failure
+  in the tool result rather than refusing the call.
+- **Delivery to the model.** Usage docs are appended to the *first*
+  tool result for that utility via R20's tool-result reshaping
+  transform. The model sees them alongside the command's output and
+  uses them when revising subsequent invocations. Repeat
+  invocations of the same utility do not re-attach the docs — they
+  are already in conversation context.
+
+## R32. Defer tap formula creation until v1 ships
 
 R21 describes the *target* distribution surface. The actual
 `apoderado.rb` in `../homebrew-tap/Formula/` is **not** to be created
