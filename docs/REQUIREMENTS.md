@@ -380,8 +380,169 @@ the requirement that introduced them.
   `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH`, `SESSION`,
   `COOKIE`, `PRIVATE`. Refined as false-positive and false-negative
   reports come in.
+- **R26 run_shell timeouts:** default 120 seconds per call,
+  model-requested override capped at an absolute ceiling of 600
+  seconds, 5-second grace between SIGTERM and SIGKILL when a timeout
+  trips.
 
-## R23. Defer tap formula creation until v1 ships
+## R23. Agent identity: Swift-first coding assistant
+
+`apoderado`'s primary purpose is agentic coding for Swift projects —
+Swift Package Manager libraries, Xcode app/library targets, Apple-
+platform tooling — and everything adjacent that producing good Swift
+code requires (shell, git, build systems, test runners, plain-text
+editing, markdown docs).
+
+- R20's prompt-template assembly transform identifies the agent as a
+  Swift coding specialist in the system prompt, orients tool use
+  around Swift workflows (SPM, `xcodebuild`, `swift test`/`swift
+  testing`, file editing, git), and surfaces project context the
+  agent should be aware of (presence of `Package.swift`, `*.xcodeproj`,
+  `Makefile`, etc.).
+- "Swift-first" is a centre of gravity, not an exclusion. The agent
+  is expected to handle YAML, JSON, shell, Markdown, and helper
+  scripts in other languages when they appear inside a Swift project's
+  working tree.
+- Non-Swift codebases are not in scope for v1 tuning. The CLI will
+  still run in them; the system prompt and heuristics are not tuned
+  for, e.g., a pure Rust monorepo, and that is acceptable.
+- This requirement frames every other design choice: tool selection
+  (R10), built-in command knowledge, system-prompt examples, and
+  default project-metadata extraction.
+
+## R24. Working directory is a hard security boundary
+
+By default the agent's filesystem access — every path-bearing tool
+argument — is rooted at the invocation's working directory. Paths
+that resolve outside that root are refused before the action runs,
+including via symlink traversal and absolute-path arguments. The
+sandbox is enforced *in addition to* the R9 approval gates, not
+instead of them.
+
+- Resolution rule: every path argument to `read_file`, `list_dir`,
+  `write_file`, `edit_file`, and `search` is realpath'd; if the
+  resolved path is not a descendant of CWD, the tool returns an error
+  to the model and the action does not execute. Approval prompts
+  cannot override this check.
+- `run_shell` inherits CWD and may `cd` within the subprocess's own
+  environment, but the surrounding CLI's notion of CWD never changes
+  mid-session. The shell is not a sandbox-escape vector for the
+  filesystem tools.
+- **Escape hatch:** `--dangerously-skip-permissions` (name matching
+  the established agentic-CLI convention) relaxes *both* the
+  filesystem sandbox *and* every R9 approval gate for the duration of
+  the run. There is no per-tool granularity; the flag is all-in
+  dangerous mode by design, so it has exactly one effect to reason
+  about.
+- The flag must be re-specified on every invocation. There is no
+  persistent "trusted forever" mode written to disk.
+- The flag name is intentionally hostile. `--help` and documentation
+  must spell out the risk in plain language (arbitrary filesystem
+  writes, arbitrary shell, no prompts) so it is never invoked by
+  reflex.
+
+## R25. `edit_file` matching policy is part of the tool call
+
+The `edit_file` tool (R10) requires the model to declare a *matching
+policy* alongside the `old` and `new` strings. The tool's behaviour
+on ambiguous matches is determined by that policy, not by hidden
+defaults. The R23 system prompt explicitly instructs the model that
+it must specify a policy with every `edit_file` call.
+
+- v1 policies:
+  - `exact_unique` — fail closed unless `old` matches exactly once in
+    the file. Designed for targeted edits where ambiguity is a bug.
+    This is the safe path the model should reach for by default.
+  - `exact_all` — replace every occurrence of `old`. Designed for
+    renames and other intentionally-broad rewrites.
+- The tool-call payload includes a `policy` field. Calls without one
+  are rejected with an error message that names the available
+  policies so the model can retry deliberately.
+- When `exact_unique` fails on zero or multiple matches, the error
+  returned to the model (via R20's tool-result reshaping transform)
+  names the failure mode — "not found" vs. "matched N times" — so
+  the model is steered toward adding surrounding context to
+  disambiguate rather than blindly escalating to `exact_all`.
+- Pattern matching, regex, and fuzzy match are not v1 policies.
+  Adding a new policy is an explicit feature, not a default.
+
+## R26. `run_shell` has a wall-clock timeout
+
+Every `run_shell` invocation runs under a wall-clock timeout. Hitting
+the timeout terminates the subprocess (SIGTERM, then SIGKILL after a
+grace period if it has not exited) and returns a structured timeout
+result to the model — captured stdout/stderr up to the cutoff, plus
+an explicit timeout marker in place of the exit code.
+
+- The model may override the default per call via an optional
+  `timeout_seconds` field on the tool payload. The request is clamped
+  to an absolute ceiling; the model cannot disable the timeout. All
+  three numbers (default, ceiling, kill grace) are R22 tunables.
+- The R23 system prompt informs the model that long-running commands
+  — full test suites, clean builds, large package fetches — may need
+  to be split into smaller invocations or given an explicit
+  `timeout_seconds` within the ceiling.
+- A timed-out shell call is a normal, recoverable event: the session
+  transcript records the partial output and timeout marker, and the
+  model is free to retry, narrow scope, or report failure.
+- **Deferred to Open Questions:** stdin handling for `run_shell`
+  (whether interactive prompts are supported, refused, or fed
+  scripted input) and any nuances of stdout/stderr interleaving and
+  real-time visibility. v1 picks reasonable defaults during
+  implementation; the requirement-level ruling is intentionally
+  postponed.
+
+## R27. Cancellation: Ctrl-C or Escape aborts in-flight work
+
+A single SIGINT (Ctrl-C) or Escape keypress cancels whatever the
+agent is currently doing and returns control to the user without
+exiting the CLI. A second consecutive cancellation, with no
+intervening progress, exits the CLI cleanly.
+
+- Cancellation targets the *innermost in-flight operation*: a
+  streaming model turn, a running `run_shell` subprocess (SIGTERM
+  then SIGKILL on the R26 grace), an approval prompt, or any other
+  tool call. The user does not need to know which layer they are
+  cancelling — one keystroke addresses whatever is on top.
+- Partial output up to the cancellation point is recorded in the
+  session transcript so the conversation history remains coherent on
+  resume. Cancellation is an explicit event in the JSONL stream
+  (R18), not a silent rollback.
+- An approval prompt cancelled via Ctrl-C/Escape is treated as an
+  explicit "no" — the gated action does not run, and the model is
+  informed so it can react in its next turn.
+- Non-interactive invocations honour SIGINT the same way: the in-
+  flight action terminates and the process exits with a non-zero
+  status. Escape is a no-op in non-TTY mode.
+- The "second cancellation exits" rule prevents users from getting
+  trapped when a model immediately kicks off new work after the
+  first cancel; it provides a deterministic two-keystroke exit
+  without needing a separate shortcut.
+
+## R28. Primary invocation: new auto-named session by default
+
+Running `apoderado` with no session argument starts a *new* session
+with an auto-generated name (R11). An existing session is joined
+only when the user explicitly passes `--session <name>`. There is no
+implicit "resume the last session" behaviour.
+
+- `apoderado` → interactive REPL, new auto-named session. The
+  generated name is reported on the first prompt so the user can
+  refer to it later via R13's `sessions` subcommands or `--session`.
+- `apoderado --session NAME` → interactive REPL targeting NAME.
+  Resumes that session if it exists under `.apoderado/sessions/`,
+  creates it under that name if it does not (matches R8).
+- Non-interactive invocations (R1) follow the same session rule: a
+  new auto-named session by default, `--session NAME` to target an
+  existing one.
+- The R13 `sessions list`/`show`/`delete`/`export` subcommands
+  operate on stored sessions; they do not establish an active
+  conversation.
+- Rationale: sessions stay cheap and disposable. A stale conversation
+  never leaks into the next task by accident, and resuming is always
+  an explicit, named act.
+
+## R29. Defer tap formula creation until v1 ships
 
 R21 describes the *target* distribution surface. The actual
 `apoderado.rb` in `../homebrew-tap/Formula/` is **not** to be created
@@ -408,5 +569,15 @@ release tarball.
 
 ## Open Questions
 
-None at this point. New questions will land here as implementation
-surfaces them.
+- **R26 `run_shell` stdin policy.** Should `run_shell` accept piped
+  input from the model's tool call, refuse stdin outright (so any
+  command needing interactive input fails closed), or feed a scripted
+  payload? Currently deferred; v1 implementation picks reasonable
+  defaults that this question will ratify or revise.
+- **R26 `run_shell` stdout/stderr policy.** Are stdout and stderr
+  reported as separate captured streams, interleaved in arrival
+  order, or both? Is anything echoed to the user's TTY in real time,
+  or only summarized after completion? Same posture: implementation
+  picks, this question ratifies.
+
+New questions will land here as implementation surfaces them.
