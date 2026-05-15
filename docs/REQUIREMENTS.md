@@ -337,7 +337,30 @@ also on the inbound side over tool results, so a secret emitted by
 `run_shell` never enters the model's context window in the first
 place.
 
-## R21. Tuning defaults
+## R21. Distribution via central Homebrew tap
+
+The `apoderado` CLI is distributed through the shared
+`intrusive-memory/homebrew-tap` repository, alongside the other
+intrusive-memory CLIs (`secuencia`, `hablare`, `bruja`, …). The formula
+does **not** live in this repository.
+
+- The formula file `apoderado.rb` is maintained in the sibling repo at
+  `../homebrew-tap/Formula/apoderado.rb`, not in `SwiftApoderado/`.
+- This repository ships no `Formula/` directory. CI, release tooling,
+  and contributor docs must not assume one exists locally.
+- The formula follows the tap's established pattern: it points at a
+  prebuilt release tarball published to this repo's GitHub Releases
+  (`apoderado-<version>-arm64-macos.tar.gz`) and pins by `sha256`,
+  rather than building from source on the user's machine.
+- Cutting a release therefore involves two repos: tag and publish the
+  tarball here, then bump `url`, `version`, and `sha256` in
+  `homebrew-tap/Formula/apoderado.rb`. Automation for this is a design
+  detail, not a requirement.
+- `depends_on` constraints (Apple Silicon, macOS Tahoe, etc.) live in
+  the tap formula; this repo's Makefile remains the source of truth
+  for how the binary is built, but the formula does not invoke it.
+
+## R22. Tuning defaults
 
 These are concrete starting values for parameters that earlier
 requirements left abstract. They are defaults — chosen so the system
@@ -357,6 +380,31 @@ the requirement that introduced them.
   `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH`, `SESSION`,
   `COOKIE`, `PRIVATE`. Refined as false-positive and false-negative
   reports come in.
+
+## R23. Defer tap formula creation until v1 ships
+
+R21 describes the *target* distribution surface. The actual
+`apoderado.rb` in `../homebrew-tap/Formula/` is **not** to be created
+yet — only once `apoderado` has a shippable v1 that produces a real
+release tarball.
+
+- "Shippable" means: the binary builds cleanly via the documented
+  release path, the v1 tool primitives (R10) and approval modes (R9)
+  work end-to-end against a real SwiftAcervo-resolved MLX model, and a
+  versioned `apoderado-<version>-arm64-macos.tar.gz` has been
+  published to this repo's GitHub Releases with a verifiable
+  `sha256`.
+- Until that bar is met, the tap stays untouched. No placeholder
+  formula, no broken `url`, no `version "0.0.0"` stub — adding the
+  formula early would let users `brew install apoderado` and get a
+  failing or non-existent download, which poisons trust in the tap
+  for every other CLI it hosts.
+- When the bar is met, the rollout is: cut the GitHub release, write
+  `homebrew-tap/Formula/apoderado.rb` against that release's tarball
+  and sha256, open the PR in `homebrew-tap`, and only then announce
+  installability.
+- This requirement is intentionally last: it is a *gating milestone*,
+  not a behavioural requirement of the CLI itself.
 
 ## Open Questions
 
