@@ -388,6 +388,9 @@ the requirement that introduced them.
   invocations before the model is informed the budget is exhausted;
   resets on the next productive tool result (any successful tool
   call, shell or otherwise).
+- **R33 auto-approve floor patterns:** the catastrophic-shell deny
+  list defined in R33's body; refined as false-positive and false-
+  negative reports come in.
 
 ## R23. Agent identity: Swift-first coding assistant
 
@@ -668,7 +671,100 @@ reuse the cached docs.
   invocations of the same utility do not re-attach the docs — they
   are already in conversation context.
 
-## R32. Defer tap formula creation until v1 ships
+## R32. Per-session lockfile prevents concurrent invocations
+
+A single named session is owned by at most one running `apoderado`
+process at a time. Concurrent invocations against the same session
+name fail closed with a clear error rather than silently interleaving
+writes into the R18 transcript.
+
+- **Mechanism.** On joining a session (R28), apoderado writes its
+  PID to `.apoderado/sessions/<name>.lock` and holds the file for
+  the duration of the run. The lockfile is removed on clean exit.
+- **Liveness check.** On lockfile acquisition, if the recorded PID
+  is not alive (`kill(pid, 0)` returns `ESRCH`), the stale lockfile
+  is overwritten with the new PID. If the PID is alive, the
+  invocation refuses with an error naming the lockfile path and the
+  holding PID so the user can investigate or kill the holder.
+- **Scope is per session, not per repo.** Two `apoderado`
+  invocations against *different* session names in the same repo
+  run concurrently with no contention — separate JSONL files,
+  separate lockfiles.
+- **Pathological recovery.** If a PID is recycled between crash and
+  reclaim, the user clears the lockfile manually
+  (`rm .apoderado/sessions/<name>.lock`). This is rare enough to
+  accept as a manual fallback rather than designing more elaborate
+  detection.
+- **Non-goal.** Multi-process collaboration on a single session is
+  not supported. The architecture is single-writer; pretending
+  otherwise would require schema changes to R18 that are not worth
+  the cost for a near-zero use case.
+
+## R33. Auto-approve danger floor under `--yes`
+
+R9's auto-approve mode (`--yes` / `--auto`) maintains a small
+hardcoded deny-list of catastrophic shell patterns that *still
+prompt* the user even when auto-approve is in effect. The floor is a
+guardrail for scripted use, not a security boundary — the security
+boundary is R24's sandbox.
+
+- **The floor applies only to `--yes` / `--auto`.**
+  `--dangerously-skip-permissions` (R24) bypasses the floor along
+  with every other approval gate. That is the explicit semantic of
+  the hostile-named flag; there is no "really-really-yes" escalator.
+- **Starting pattern list (R22 tunable):**
+  - `rm -rf` / `rm -fr` / `rm -Rf` against any path resolving to an
+    absolute root, a `..`-escape outside CWD, or `~`.
+  - `git push --force` or `--force-with-lease` against any ref
+    matching `main`, `master`, or `develop[ment]`.
+  - Pipe-to-shell from `curl` or `wget` (`curl … | sh`,
+    `wget -O- … | bash`, and common variants).
+  - `chmod -R 777` against any path.
+  - Any write target resolving under `/etc`, `/usr`, `/System`,
+    `/Library`, or `/var`.
+- **Prompt, do not refuse.** A matching command surfaces the same
+  prompt the per-action mode would show, with an extra "auto-approve
+  floor" label so the user knows why the prompt appeared mid-script.
+  Approval runs the command; denial refuses it and informs the
+  model.
+- **Match the resolved command, not the raw string.** Patterns are
+  applied after stripping leading `VAR=value` assignments and any
+  leading `sudo`, and after expanding obvious shell-quote wrappers
+  (`bash -c "rm -rf /"`) into their inner command. The model cannot
+  bypass the floor by quoting.
+- **Keep the list small.** It catches obviously catastrophic
+  patterns, not every footgun. Expanding it indefinitely produces
+  prompt fatigue under `--yes` and defeats the flag's purpose.
+
+## R34. No configuration file in v1
+
+The R22 tunables and other internal constants are Swift source-level
+constants for v1. There is no `.apoderado/config.toml` (or
+equivalent) shipped, and the CLI does not read one. Tunables that
+users actually need are exposed through channels that already exist:
+CLI flags, environment variables (R7), and dedicated files for
+narrowly-scoped configuration (R17 allowlist, R12 session storage).
+
+- **Why no config file.** A config-file schema is a forever
+  interface — once `.apoderado/config.toml` exists in user repos,
+  the schema cannot be restructured casually. Designing it
+  speculatively, before evidence of which tunables matter, produces
+  a worse schema than designing it later from real demand.
+- **Escape hatch for power users.** Tunables are co-located in a
+  single Swift file. Fork and recompile is a sub-minute operation
+  for anyone who needs to bump, say, the R30 retry budget or the
+  R15 entropy threshold before the project has shipped a real
+  config story. R19 already accepts this trade-off for transforms.
+- **Promotion criteria.** A config file lands when (a) multiple
+  users demonstrate they want to tune the same thing and (b) the
+  desired shape has stabilized through real use. Not before.
+- **Non-goal.** Per-feature config files (separate TOML for models,
+  transforms, redaction, etc.) are not the path forward when the
+  time comes. If config lands, it lands as one unified file.
+  Multiple config-file locations multiply "where is this set"
+  confusion.
+
+## R35. Defer tap formula creation until v1 ships
 
 R21 describes the *target* distribution surface. The actual
 `apoderado.rb` in `../homebrew-tap/Formula/` is **not** to be created
