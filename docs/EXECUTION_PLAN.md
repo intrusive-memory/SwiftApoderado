@@ -46,10 +46,25 @@ sandbox, no approval, no sessions yet.
   prompted-fallback paths both compile but the prompted path is a
   no-op stub; tool dispatch lands in Phase 2.
 
-**Acceptance.** An integration test loads a small MLX model via
-SwiftAcervo and asserts the model returns non-empty assistant text
-against a deterministic prompt. Test runs on CI on a macOS arm64
-runner with the model cached.
+**Development model.** Development and integration tests target
+`mlx-community/Qwen3-Coder-Next-4bit` (Qwen3-Coder-Next, 4-bit MLX
+quantization, ~45GB, 262K context). The slug is already published
+to the intrusive-memory CDN; SwiftAcervo resolves it without an
+`acervo ship` step. This is the *development* model only — R7 still
+forbids a baked-in runtime default, and the CLI continues to fail
+closed when invoked without `--model` or `APODERADO_MODEL`. Phase 1
+acceptance tests pass this slug explicitly.
+
+Memory note: Qwen3-Coder-Next-4bit needs roughly 64 GB unified
+memory to run comfortably at non-trivial context lengths (model
+weights + KV cache + macOS headroom). Contributors on 32 GB
+machines should expect to cap effective context length at runtime
+or substitute a smaller catalog model for local iteration.
+
+**Acceptance.** An integration test loads
+`mlx-community/Qwen3-Coder-Next-4bit` via SwiftAcervo and asserts
+the model returns non-empty assistant text against a deterministic
+prompt. Test runs on a macOS arm64 runner with the model cached.
 
 ## Phase 2 — Parallel tracks (three independent work streams)
 
